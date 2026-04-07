@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""
+hl_agent_bot_v4.py
+Final Orderbook Imbalance Scalp Bot with:
+- Real orderbook-based backtest
+- Safe close_position logic
+- Candle cache alignment
+- Consistent SL/TP handling
+- Exchange-agnostic position tracking
+"""
+
+import os
+import asyncio
+import json
+import time
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+
+import numpy as np
+import pandas as pd
+from aiohttp import ClientSession, web
+from dotenv import load_dotenv
+
+# optional import for ccxt async
+try:
+    import ccxt.async_support as ccxt
+except Exception:
+    ccxt = None
+
+# ---------------------------
+# Config / env
+# ---------------------------
+load_dotenv()
+AGENT_API_KEY = os.getenv("AGENT_API_KEY", "")
+AGENT_API_SECRET = os.getenv("AGENT_API_SECRET", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes")
+BACKTEST = os.getenv("BACKTEST", "false").lower() in ("1", "true", "yes")
+BACKTEST_CANDLES_CSV = os.getenv("BACKTEST_CANDLES_CSV", "hist_candles.csv")
+
+SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT").split(",")
+INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "5"))
+BOOK_DEPTH = int(os.getenv("BOOK_DEPTH", "25"))
+IMBALANCE_THRESHOLD = float(os.getenv("IMBALANCE_THRESHOLD", "0.30"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.001"))  # ✅ Reduced to 0.1%
+MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "5"))
+MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "5"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))
+POSITION_FILE = os.getenv("POSITION_FILE", "positions.json")
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance")
+
+# Slippage & fee modeling
+ASSUMED_TAKER_FEE = float(os.getenv("ASSUMED_TAKER_FEE", "0.0006"))  # 0.06%
+ASSUMED_SLIPPAGE_PCT = float(os.getenv("ASSUMED_SLIPPAGE_PCT", "0.001"))  # 0.1%
+
+# ATR / sizing guards
+ATR_MIN = float(os.getenv("ATR_MIN", "0.5"))
+MAX_POSITION_NOTIONAL = float(os.getenv("MAX_POSITION_NOTIONAL", "200"))
+
+# Locks + shared
+_positions_lock = asyncio.Lock()
+_state_lock = asyncio.Lock()
+_http_session: Optional[ClientSession] = None
+
+positions: List[Dict[str, Any]] = []
+state: Dict[str, Any] = {"start_ts": int(time.time())}
+trade_stats: Dict[str, Any] = {"total_opened": 0, "total_closed": 0, "pnl": 0.0}
+
+# candle cache to reduce recomputation
+_candle_cache: Dict[str, pd.DataFrame] = {}
+
+# ---------------------------
+# Utils
+# ---------------------------
+def now_ts():
+    return int(time.time())
+
+def human_ts(ts=None):
+    return datetime.utcfromtimestamp(ts if ts else time.time()).isoformat()
+
+async def _http_post(url: str, json_payload: dict):
+    global _http_session
+    if _http_session is None:
+        _http_session = ClientSession()
+    async with _http_session.post(url, json=json_payload) as resp:
+        return await resp.text()
+
+async def tg_send(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[tg] missing TELEGRAM_TOKEN/CHAT_ID:", text)
+        return
+    try:
+        await _http_post(TELEGRAM_API, {"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    except Exception as e:
+        print("[tg_send] error:", e)
+
+def _load_json_file(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+async def load_state_and_positions():
+    global positions, state
+    async with _positions_lock:
+        positions = _load_json_file(POSITION_FILE, [])
+    async with _state_lock:
+        s = _load_json_file(STATE_FILE, {})
+        if "start_ts" not in s:
+            s["start_ts"] = state.get("start_ts", int(time.time()))
+        state.update(s)
+
+async def save_positions():
+    async with _positions_lock:
+        with open(POSITION_FILE, "w", encoding="utf-8") as f:
+            json.dump(positions, f, indent=2, ensure_ascii=False)
+
+async def save_state():
+    async with _state_lock:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+
+# ---------------------------
+# Indicators
+# ---------------------------
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    period = 14
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df['rsi'] = 100 - (100 / (1 + rs))
+    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = df['ema12'] - df['ema26']
+    df['signal_line'] = df['macd'].ewm(span=9, adjust=False).mean()
+    tr = np.maximum(df['high'] - df['low'],
+                    np.maximum((df['high'] - df['close'].shift(1)).abs(),
+                               (df['low'] - df['close'].shift(1)).abs()))
+    df['tr'] = tr
+    df['atr'] = tr.rolling(window=14, min_periods=14).mean()
+    return df
+
+def orderbook_imbalance(ob: Dict[str, Any], depth: int, price_power: float = 2.0) -> float:
+    bids = ob.get("bids", [])[:depth]
+    asks = ob.get("asks", [])[:depth]
+    if not bids and not asks:
+        return 0.0
+    # compute mid
+    best_bid = float(bids[0][0]) if bids else None
+    best_ask = float(asks[0][0]) if asks else None
+    if best_bid is None and best_ask is None:
+        return 0.0
+    if best_bid is None:
+        mid = best_ask
+    elif best_ask is None:
+        mid = best_bid
+    else:
+        mid = (best_bid + best_ask) / 2.0
+
+    def weighted_sum(entries):
+        s = 0.0
+        for price, qty in entries:
+            price = float(price); qty = float(qty)
+            dist = abs(price - mid) / max(1e-8, mid)
+            weight = 1.0 / ((1.0 + dist) ** price_power)
+            s += qty * weight
+        return s
+
+    bid_vol = weighted_sum(bids)
+    ask_vol = weighted_sum(asks)
+    denom = bid_vol + ask_vol
+    if denom == 0:
+        return 0.0
+    return (bid_vol - ask_vol) / denom
+
+def compute_atr_from_candles(df: pd.DataFrame, period: int = 14) -> float:
+    if df is None or len(df) < period + 1:
+        return 0.0
+    df2 = compute_indicators(df)
+    atr = df2['atr'].iloc[-1]
+    return float(atr if not np.isnan(atr) else 0.0)
+
+# ---------------------------
+# HLClient using ccxt.async_support
+# ---------------------------
+class HLClient:
+    def __init__(self, api_key: str = "", api_secret: str = "", exchange_id: str = "binance"):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.exchange_id = exchange_id
+        self.exchange = None
+        self.rest_rate_limit = 0.2  # safe sleep between REST calls
+        self._last_ob = {}
+        self._fake_balance = None  # used in backtest mode
+
+    async def init(self):
+        if ccxt is None:
+            raise RuntimeError("ccxt.async_support is required. Install with `pip install ccxt`.")
+        ex_class = getattr(ccxt, self.exchange_id)
+        self.exchange = ex_class({
+            "apiKey": self.api_key,
+            "secret": self.api_secret,
+            "enableRateLimit": True,
+            "options": {"defaultType": "future"}
+        })
+        await self.exchange.load_markets()
+
+    async def close(self):
+        if self.exchange:
+            await self.exchange.close()
+
+    async def fetch_order_book_rest(self, symbol: str, depth: int = 25) -> Dict[str, Any]:
+        try:
+            ob = await self.exchange.fetch_order_book(symbol, depth)
+            self._last_ob[symbol] = ob
+            await asyncio.sleep(self.rest_rate_limit)
+            return ob
+        except Exception as e:
+            return self._last_ob.get(symbol, {"bids": [], "asks": [], "timestamp": now_ts()})
+
+    async def get_orderbook(self, symbol: str, depth: int = 25) -> Dict[str, Any]:
+        return await self.fetch_order_book_rest(symbol, depth=depth)
+
+    async def get_candles(self, symbol: str, interval_seconds: int = 60, limit: int = 100) -> Optional[pd.DataFrame]:
+        tf_map = {60: "1m", 300: "5m", 900: "15m", 3600: "1h"}
+        timeframe = tf_map.get(interval_seconds, "1m")
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+        except Exception as e:
+            return self._last_ob.get(symbol, {"bids": [], "asks": [], "timestamp": now_ts()})
+
+    async def get_wallet_balance_usdt(self) -> float:
+        if BACKTEST and self._fake_balance is not None:
+            return float(self._fake_balance)
+        try:
+            bal = await self.exchange.fetch_balance()
+            total = bal.get('total', {}) or {}
+            for stable in ('USDT', 'USDC', 'BUSD'):
+                if stable in total:
+                    return float(total.get(stable, 0.0))
+            return 0.0
+        except Exception as e:
+            return 0.0
+
+    async def create_market_order(self, symbol: str, side: str, qty: float, params: dict = None):
+        params = params or {}
+        try:
+            order = await self.exchange.create_order(symbol, "market", side, qty, None, params)
+            await asyncio.sleep(self.rest_rate_limit)
+            return order
+        except Exception as e:
+            raise
+
+    async def place_market_order(self, symbol: str, side: str, qty: float, leverage: int = 1):
+        try:
+            return await self.create_market_order(symbol, side, qty)
+        except Exception as e:
+            raise
+
+    async def place_stop_order(self, symbol: str, side: str, qty: float, stop_price: float, reduce_only: bool = True):
+        exid = getattr(self.exchange, "id", "").lower()
+        try:
+            if exid == "binance":
+                params = {"stopPrice": stop_price, "reduceOnly": reduce_only}
+                return await self.exchange.create_order(symbol, "STOP_MARKET", 'sell' if side == 'buy' else 'buy', qty, None, params)
+            elif exid == "bybit":
+                params = {"stop_px": stop_price, "reduce_only": reduce_only}
+                return await self.exchange.create_order(symbol, "Stop", 'sell' if side == 'buy' else 'buy', qty, stop_price, params)
+            else:
+                params = {"stopPrice": stop_price, "reduceOnly": reduce_only}
+                return await self.exchange.create_order(symbol, "STOP", 'sell' if side == 'buy' else 'buy', qty, stop_price, params)
+        except Exception as e:
+            raise
+
+    async def close_position(self, symbol: str):
+        """
+        Best-effort close:
+         - try fetch_positions if supported
+         - fallback to global positions list
+         - if found, place opposite market order with reduceOnly param
+        """
+        try:
+            # 1) try fetch positions (if exchange supports)
+            if hasattr(self.exchange, "fetch_positions"):
+                pos_list = await self.exchange.fetch_positions([symbol])
+                for p in pos_list:
+                    info = p if isinstance(p, dict) else {}
+                    size = float(info.get('contracts') or info.get('size') or info.get('positionAmt') or 0.0)
+                    if abs(size) > 0:
+                        side = "sell" if size > 0 else "buy"
+                        qty = abs(size)
+                        params = {"reduceOnly": True}
+                        return await self.create_market_order(symbol, side, qty, params=params)
+            # 2) fallback to global positions list (live mode)
+            async with _positions_lock:
+                for rec in list(positions):
+                    if rec.get("symbol") == symbol and rec.get("active", True):
+                        side = "sell" if rec["side"] == "buy" else "buy"
+                        qty = rec["qty"]
+                        params = {"reduceOnly": True}
+                        return await self.create_market_order(symbol, side, qty, params=params)
+            return {"closed": False, "reason": "no-position-found"}
+        except Exception as e:
+            raise
+
+# create client instance (init in main)
+hl = HLClient(api_key=AGENT_API_KEY, api_secret=AGENT_API_SECRET, exchange_id=EXCHANGE_ID)
+
+# ---------------------------
+# Position helpers
+# ---------------------------
+def load_position_by_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    for p in positions:
+        if p.get("symbol") == symbol and p.get("active", True):
+            return p
+    return None
+
+async def open_position_record(symbol, side, qty, entry_price, sl_price, tp_price, meta=None):
+    rec = {
+        "id": f"{symbol}-{now_ts()}",
+        "symbol": symbol,
+        "side": side,
+        "qty": float(qty),
+        "entry_price": float(entry_price),
+        "sl_price": float(sl_price) if sl_price is not None else None,
+        "tp_price": float(tp_price) if tp_price is not None else None,
+        "meta": meta or {},
+        "open_ts": now_ts(),
+        "active": True
+    }
+    async with _positions_lock:
+        positions.append(rec)
+        trade_stats["total_opened"] = trade_stats.get("total_opened", 0) + 1
+        await save_positions()
+    return rec
+
+async def close_position_record(rec, close_price, reason="unknown"):
+    async with _positions_lock:
+        for p in positions:
+            if p["id"] == rec["id"]:
+                p["active"] = False
+                p["close_price"] = float(close_price)
+                p["close_ts"] = now_ts()
+                p["close_reason"] = reason
+                trade_stats["total_closed"] = trade_stats.get("total_closed", 0) + 1
+                try:
+                    if p["side"] == "buy":
+                        pnl = (float(close_price) - float(p["entry_price"])) * float(p["qty"])
+                    else:
+                        pnl = (float(p["entry_price"]) - float(close_price)) * float(p["qty"])
+                    fee_cost = (abs(p["entry_price"] * p["qty"]) + abs(close_price * p["qty"])) * ASSUMED_TAKER_FEE
+                    slippage_cost = (abs(p["entry_price"] * p["qty"]) + abs(close_price * p["qty"])) * ASSUMED_SLIPPAGE_PCT
+                    net_pnl = pnl - fee_cost - slippage_cost
+                    trade_stats["pnl"] = trade_stats.get("pnl", 0.0) + float(net_pnl)
+                except Exception:
+                    pass
+                await save_positions()
+                break
+
+# ---------------------------
+# Candle cache helper
+# ---------------------------
+async def get_cached_candles(symbol, interval_seconds=60, limit=100):
+    df_new = await hl.get_candles(symbol, interval_seconds=interval_seconds, limit=limit)
+    if df_new is None:
+        return _candle_cache.get(symbol)
+    old = _candle_cache.get(symbol)
+    if old is None:
+        _candle_cache[symbol] = df_new
+        return df_new
+    # align by timestamp, update last or append
+    try:
+        last_ts = int(df_new['timestamp'].iloc[-1].timestamp() * 1000)
+        if last_ts in old['timestamp'].values:
+            old.iloc[-1] = df_new.iloc[-1]
+        else:
+            old = pd.concat([old, df_new.iloc[-1:]], ignore_index=True)
+        _candle_cache[symbol] = old
+        return old
+    except Exception:
+        _candle_cache[symbol] = df_new
+        return df_new
+
+# ---------------------------
+# Core logic: per symbol
+# ---------------------------
+async def process_symbol(symbol: str):
+    try:
+        last_action = state.get(symbol, {}).get("last_action_ts", 0)
+        if now_ts() - last_action < COOLDOWN_SECONDS:
+            return
+
+        if load_position_by_symbol(symbol):
+            return
+
+        ob = await hl.get_orderbook(symbol, depth=BOOK_DEPTH)
+        if not ob:
+            return
+
+        imb = orderbook_imbalance(ob, BOOK_DEPTH)
+        if abs(imb) < IMBALANCE_THRESHOLD:
+            return
+
+        side = "buy" if imb > 0 else "sell"
+
+        df = await get_cached_candles(symbol, interval_seconds=60, limit=50)
+        if df is None or len(df) < 15:
+            return
+
+        atr = compute_atr_from_candles(df, period=14)
+        atr = max(atr, ATR_MIN)
+        balance_usdt = await hl.get_wallet_balance_usdt()
+        if balance_usdt <= 0:
+            if BACKTEST:
+                balance_usdt = 1000.0
+            else:
+                return
+
+        stop_atr_mult = 1.2
+        stop_distance = atr * stop_atr_mult
+        entry_price = float(df['close'].iloc[-1])
+        risk_amount = balance_usdt * RISK_PER_TRADE
+        qty = (risk_amount * MAX_LEVERAGE) / (stop_distance * entry_price)
+        if qty * entry_price < MIN_NOTIONAL_USDT:
+            return
+        max_qty = MAX_LEVERAGE * (MAX_POSITION_NOTIONAL / entry_price)
+        qty = float(min(qty, max_qty))
+        if qty <= 0:
+            return
+
+        if side == "buy":
+            sl_price = max(0.0001, entry_price - stop_distance)
+            tp_price = entry_price + stop_distance * 1.5
+        else:
+            sl_price = entry_price + stop_distance
+            tp_price = entry_price - stop_distance * 1.5
+
+        # expected profit check (fees + slippage)
+        expected_gross = (tp_price - entry_price) * qty if side == "buy" else (entry_price - tp_price) * qty
+        estimated_costs = (entry_price * qty + tp_price * qty) * (ASSUMED_TAKER_FEE + ASSUMED_SLIPPAGE_PCT)
+        if expected_gross <= estimated_costs:
+            return
+
+        if DRY_RUN or BACKTEST:
+            await tg_send(f"[DRY_RUN/BACKTEST] OPEN {side.upper()} {symbol} qty={qty:.6f} @ {entry_price:.2f} SL={sl_price:.2f} TP={tp_price:.2f} imb={imb:.3f}")
+            rec = await open_position_record(symbol, side, qty, entry_price, sl_price, tp_price, meta={"imbalance": imb})
+            state.setdefault(symbol, {})["last_action_ts"] = now_ts()
+            await save_state()
+            return
+
+        # live order
+        try:
+            order = await hl.place_market_order(symbol, side, qty, leverage=MAX_LEVERAGE)
+            exec_price = float(order.get("average") or order.get("price") or entry_price)
+            try:
+                await hl.place_stop_order(symbol, side, qty, stop_price=sl_price, reduce_only=True)
+            except Exception as e:
+                await tg_send(f"[WARN] could not place exchange SL for {symbol}: {e}")
+            rec = await open_position_record(symbol, side, qty, exec_price, sl_price, tp_price, meta={"imbalance": imb})
+            await tg_send(f"[LIVE] OPENED {side.upper()} {symbol} qty={qty:.6f} @ {exec_price:.2f} SL={sl_price:.2f} TP={tp_price:.2f} imb={imb:.3f}")
+            state.setdefault(symbol, {})["last_action_ts"] = now_ts()
+            await save_state()
+        except Exception as e:
+            await tg_send(f"[ERROR] placing market order for {symbol}: {e}")
+
+    except Exception as ex:
+        await tg_send(f"[ERROR] process_symbol {symbol}: {ex}")
+
+# ---------------------------
+# Monitor positions (bar-level)
+# ---------------------------
+async def monitor_positions_loop():
+    while True:
+        try:
+            async with _positions_lock:
+                pos_snapshot = [p.copy() for p in positions]
+            if not pos_snapshot:
+                await asyncio.sleep(1)
+                continue
+
+            for p in pos_snapshot:
+                if not p.get("active", True):
+                    continue
+                symbol = p["symbol"]
+                try:
+                    df = await get_cached_candles(symbol, interval_seconds=60, limit=5)
+                    if df is None or len(df) < 15:
+                        continue
+                    last_price = float(df['close'].iloc[-1])
+                    if p["side"] == "buy":
+                        if last_price <= p["sl_price"]:
+                            await tg_send(f"[SL] {symbol} BUY sl={p['sl_price']} hit @ {last_price}")
+                            if not DRY_RUN:
+                                try:
+                                    await hl.close_position(symbol)
+                                except Exception as e:
+                                    await tg_send(f"[WARN] close_position failed {symbol}: {e}")
+                            await close_position_record(p, last_price, reason="SL")
+                        elif last_price >= p["tp_price"]:
+                            await tg_send(f"[TP] {symbol} BUY tp={p['tp_price']} hit @ {last_price}")
+                            if not DRY_RUN:
+                                try:
+                                    await hl.close_position(symbol)
+                                except Exception as e:
+                                    await tg_send(f"[WARN] close_position failed {symbol}: {e}")
+                            await close_position_record(p, last_price, reason="TP")
+                    else:
+                        if last_price >= p["sl_price"]:
+                            await tg_send(f"[SL] {symbol} SELL sl={p['sl_price']} hit @ {last_price}")
+                            if not DRY_RUN:
+                                try:
+                                    await hl.close_position(symbol)
+                                except Exception as e:
+                                    await tg_send(f"[WARN] close_position failed {symbol}: {e}")
+                            await close_position_record(p, last_price, reason="SL")
+                        elif last_price <= p["tp_price"]:
+                            await tg_send(f"[TP] {symbol} SELL tp={p['tp_price']} hit @ {last_price}")
+                            if not DRY_RUN:
+                                try:
+                                    await hl.close_position(symbol)
+                                except Exception as e:
+                                    await tg_send(f"[WARN] close_position failed {symbol}: {e}")
+                            await close_position_record(p, last_price, reason="TP")
+                except Exception as e:
+                    await tg_send(f"[ERROR] monitoring {symbol}: {e}")
+        except Exception as e:
+            await tg_send(f"[ERROR] monitor_positions_loop: {e}")
+        await asyncio.sleep(max(1, INTERVAL_SECONDS // 2))
+
+# ---------------------------
+# /status endpoint
+# ---------------------------
+async def handle_status(request):
+    async with _positions_lock:
+        pos_copy = [p.copy() for p in positions]
+    async with _state_lock:
+        state_copy = dict(state)
+    uptime = now_ts() - state_copy.get("start_ts", now_ts())
+    return web.json_response({
+        "ts": now_ts(),
+        "uptime_s": uptime,
+        "symbols": SYMBOLS,
+        "dry_run": DRY_RUN,
+        "backtest": BACKTEST,
+        "positions": pos_copy,
+        "state": state_copy,
+        "trade_stats": trade_stats
+    })
+
+# ---------------------------
+# Backtest runner (real orderbook)
+# ---------------------------
+def run_backtest_on_csv(csv_path: str, symbol: str, initial_balance=1000.0):
+    """
+    Full backtest using real orderbook logic.
+    Simulates orderbook from candles and uses same indicators as live bot.
+    """
+    df = pd.read_csv(csv_path, parse_dates=["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df['timestamp'] = df['timestamp'].apply(lambda x: int(x.timestamp() * 1000))  # to ms
+
+    # Simulate orderbook from candles
+    def synthetic_orderbook(row):
+        mid = (row['high'] + row['low']) / 2
+        # Generate dummy bids/asks around mid (simplified)
+        bids = [[mid - i * 0.01, row['volume'] * 0.01] for i in range(1, BOOK_DEPTH+1)]
+        asks = [[mid + i * 0.01, row['volume'] * 0.01] for i in range(1, BOOK_DEPTH+1)]
+        return {"bids": bids, "asks": asks, "timestamp": int(row['timestamp'])}
+
+    backtest_positions = []
+    backtest_stats = {"total_opened": 0, "total_closed": 0, "pnl": 0.0}
+    balance = initial_balance
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        ob = synthetic_orderbook(row)
+        imb = orderbook_imbalance(ob, BOOK_DEPTH)
+        if abs(imb) >= IMBALANCE_THRESHOLD:
+            side = "buy" if imb > 0 else "sell"
+            atr = compute_atr_from_candles(df.iloc[:i+1], period=14)
+            atr = max(atr, ATR_MIN)
+            entry_price = float(row['close'])
+            stop_distance = atr * 1.2
+            risk_amount = balance * RISK_PER_TRADE
+            qty = (risk_amount * MAX_LEVERAGE) / (stop_distance * entry_price)
+            if qty * entry_price < MIN_NOTIONAL_USDT:
+                continue
+            max_qty = MAX_LEVERAGE * (MAX_POSITION_NOTIONAL / entry_price)
+            qty = min(qty, max_qty)
+            if qty <= 0:
+                continue
+
+            if side == "buy":
+                sl_price = max(0.0001, entry_price - stop_distance)
+                tp_price = entry_price + stop_distance * 1.5
+            else:
+                sl_price = entry_price + stop_distance
+                tp_price = entry_price - stop_distance * 1.5
+
+            # Open position logic
+            rec = {
+                "id": f"BT-{symbol}-{i}",
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "entry_price": entry_price,
+                "sl_price": sl_price,
+                "tp_price": tp_price,
+                "open_ts": int(row['timestamp']),
+                "active": True
+            }
+            backtest_positions.append(rec)
+            backtest_stats["total_opened"] += 1
+
+        # Close positions
+        for p in list(backtest_positions):
+            if not p.get("active", True):
+                continue
+            row = df.iloc[i]
+            last_price = float(row['close'])
+            if p["side"] == "buy":
+                if last_price <= p["sl_price"]:
+                    close_price = p["sl_price"]
+                    p["active"] = False
+                    backtest_stats["total_closed"] += 1
+                    pnl = (close_price - p["entry_price"]) * p["qty"]
+                    costs = (p["entry_price"]*p["qty"] + close_price*p["qty"]) * (ASSUMED_TAKER_FEE + ASSUMED_SLIPPAGE_PCT)
+                    backtest_stats["pnl"] += (pnl - costs)
+                elif last_price >= p["tp_price"]:
+                    close_price = p["tp_price"]
+                    p["active"] = False
+                    backtest_stats["total_closed"] += 1
+                    pnl = (close_price - p["entry_price"]) * p["qty"]
+                    costs = (p["entry_price"]*p["qty"] + close_price*p["qty"]) * (ASSUMED_TAKER_FEE + ASSUMED_SLIPPAGE_PCT)
+                    backtest_stats["pnl"] += (pnl - costs)
+            else:
+                if last_price >= p["sl_price"]:
+                    close_price = p["sl_price"]
+                    p["active"] = False
+                    backtest_stats["total_closed"] += 1
+                    pnl = (p["entry_price"] - close_price) * p["qty"]
+                    costs = (p["entry_price"]*p["qty"] + close_price*p["qty"]) * (ASSUMED_TAKER_FEE + ASSUMED_SLIPPAGE_PCT)
+                    backtest_stats["pnl"] += (pnl - costs)
+                elif last_price <= p["tp_price"]:
+                    close_price = p["tp_price"]
+                    p["active"] = False
+                    backtest_stats["total_closed"] += 1
+                    pnl = (p["entry_price"] - close_price) * p["qty"]
+                    costs = (p["entry_price"]*p["qty"] + close_price*p["qty"]) * (ASSUMED_TAKER_FEE + ASSUMED_SLIPPAGE_PCT)
+                    backtest_stats["pnl"] += (pnl - costs)
+
+    # Save backtest positions and stats
+    with open("backtest_positions.json", "w", encoding="utf-8") as f:
+        json.dump(backtest_positions, f, indent=2, ensure_ascii=False)
+    print(f"Backtest {symbol} result:", backtest_stats)
+    return backtest_stats
+
+# ---------------------------
+# Main
+# ---------------------------
+async def main():
+    await load_state_and_positions()
+    await tg_send(f"[BOT START] DRY_RUN={DRY_RUN} BACKTEST={BACKTEST} symbols={','.join(SYMBOLS)}")
+
+    # init exchange client
+    if not BACKTEST:
+        try:
+            await hl.init()
+        except Exception as e:
+            print("HLClient init failed:", e)
+            return
+
+    # start status server
+    app = web.Application()
+    app.add_routes([web.get("/status", handle_status)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    await tg_send("Status HTTP server started at http://127.0.0.1:8080/status")
+
+    # start monitor
+    asyncio.create_task(monitor_positions_loop())
+
+    if BACKTEST:
+        if os.path.exists(BACKTEST_CANDLES_CSV):
+            for sym in SYMBOLS:
+                res = run_backtest_on_csv(BACKTEST_CANDLES_CSV, sym, initial_balance=1000.0)
+                print(f"[BACKTEST] {sym} stats:", res)
+            await tg_send(f"[BACKTEST DONE] results printed to console.")
+        else:
+            print("BACKTEST enabled but CSV not found:", BACKTEST_CANDLES_CSV)
+        while True:
+            await asyncio.sleep(3600)
+        return
+
+    # symbol loop
+    while True:
+        tasks = [process_symbol(sym) for sym in SYMBOLS]
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(INTERVAL_SECONDS)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Exiting...")
